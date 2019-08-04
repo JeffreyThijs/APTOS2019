@@ -13,17 +13,19 @@ from keras.preprocessing.image import ImageDataGenerator
 from keras.applications import DenseNet121
 from keras.optimizers import Adam
 from sklearn.metrics import cohen_kappa_score
-import cv2
-from PIL import Image
+import cv2 as cv
+import pandas as pd
 
-def read_csv(filename):
+os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/extras/CUPTI/lib64"
+
+def read_csv(filename, delimiter=','):
 
     csv_data = dict()
     keys = []
 
     with open(filename) as f:
 
-        csv_reader = csv.reader(f, delimiter=',')
+        csv_reader = csv.reader(f, delimiter=delimiter)
 
         for i, row in enumerate(csv_reader):
 
@@ -35,15 +37,44 @@ def read_csv(filename):
                 for key, data in zip(keys, row):
                     csv_data[key].append(data)
 
-        print(f'Processed {i} lines.')
+        print('Processed {} lines.'.format(i))
 
     return csv_data, i
 
-def preprocess_image(image_path, desired_size=224):
-    im = Image.open(image_path)
-    im = im.resize((desired_size, )*2, resample=Image.LANCZOS)
-    
-    return im
+def write_csv(filename, data, delimiter=',', index=True):
+
+    keys = [key for key in data]
+    rows = len(data[keys[0]])
+
+    with open(filename, mode='w') as f:
+        csv_writer = csv.writer(f, delimiter=delimiter)
+
+        if index:
+            csv_writer.writerow(keys)
+
+        for i in range(rows):
+            row = []
+            for key in keys:
+                row.append(data[key][i])
+            csv_writer.writerow(row)
+
+        print('Processed {} lines.'.format(i))
+
+
+def preprocess_image(image_path, grayscale=False, width=224, height=224, output_channels=None):
+    img = cv.imread(image_path)
+    img = cv.resize(img, (width, height), interpolation=cv.INTER_CUBIC)
+
+    if grayscale:
+        img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+        img = cv.addWeighted(img, 4, cv.GaussianBlur(img, (0,0) , (width+height)/20), -4, 128)
+
+        if output_channels is None:
+            img = np.expand_dims(img, axis=2)
+        else:
+            img = np.stack([img] * output_channels, axis=2)
+
+    return img
 
 class CustomMetric(Callback):
 
@@ -77,7 +108,8 @@ class Classifier():
         self.labels = labels
         self.label_size = len(labels)
 
-    def build(self, densenet=True, verbose=True):
+    def build(self, densenet=True, verbose=True, 
+              densenet_weights='/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5'):
 
         if not densenet:
 
@@ -118,7 +150,7 @@ class Classifier():
 
         else:
             densenet = DenseNet121(
-                weights='/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5',
+                weights=densenet_weights,
                 include_top=False,
                 input_shape=self.input_dims
             )
@@ -139,7 +171,7 @@ class Classifier():
         optimizer = Adam(lr=0.00005)
         self.model.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
 
-    def train(self, data, data_split=0.33, epochs=100, batch_size=4, use_callbacks=True):
+    def train(self, data, data_split=0.15, epochs=100, batch_size=8, use_callbacks=True):
 
         x, y = data["x"], data["y"]
         x_train, x_val, y_train, y_val = train_test_split(x, y, test_size=data_split)
@@ -159,16 +191,16 @@ class Classifier():
             mcp_save = ModelCheckpoint('best_model.hdf5', 
                                        save_best_only=True, 
                                        monitor='val_loss')
-            reduce_lr_loss = ReduceLROnPlateau(monitor='val_loss', 
-                                               factor=0.5, 
-                                               patience=5, 
-                                               verbose=1, 
-                                               epsilon=1e-4)
+            # reduce_lr_loss = ReduceLROnPlateau(monitor='val_loss', 
+            #                                    factor=0.5, 
+            #                                    patience=5, 
+            #                                    verbose=1, 
+            #                                    epsilon=1e-4)
 
                                             
             qwk = CustomMetric()
 
-            callbacks = [early_stopping, mcp_save, reduce_lr_loss, qwk]
+            callbacks = [early_stopping, mcp_save, qwk]
         else:
             callbacks = None
 
@@ -231,22 +263,7 @@ class Classifier():
                                  callbacks=callbacks)
 
     def predict(self, data):
-
-        def decode_onehot(x):
-            return np.argmax(x).astype(int)
-
-        predictions = []
-
-        for i, image in enumerate(data["testing_data"]["x"]):
-            image = np.expand_dims(image, 0)
-
-            prediction = decode_onehot(self.model.predict(image)[0])
-            predictions.append([i+1, prediction])
-
-            if (i % 10 == 9):
-                print("predicted {} of {}".format(i+1, len(data["testing_data"]["x"])))
-
-        return predictions
+        return self.model.predict(data)
             
     def load(self, filename):
         self.model = load_model(filename)
@@ -260,53 +277,103 @@ class Classifier():
             return "grayscale"
         elif self.channels == 3:
             return "rgb"
-        elif self.channels == 34:
+        elif self.channels == 4:
             return "rgba"
         else:
             ValueError("Invalid input channels!")
 
 def get_multilabel(x, n_labels, dtype=np.uint8):
-    y = np.zeros((n_classes), dtype=dtype)
+    y = np.zeros((n_labels), dtype=dtype)
     for i in range(int(x)+1):
         y[i] = 1
 
     return y
 
-if __name__ == "__main__":
+def train_model(csv_file, train_dir, n_classes=5, train_cache_file="x_train.npy", epochs=20,
+                densenet_weights='/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5'):
 
-    train_dir = "/media/hdd/data/train_images"
-    train_csv = "/media/hdd/data/train.csv"
-    cache_file = "x_train.npy"
+    data, N = read_csv(csv_file)
 
-    data, N = read_csv(train_csv)
-    n_classes = 5
-
-    if not os.path.exists(cache_file):
+    if not os.path.exists(train_cache_file):
 
         x_train = np.empty((N, 224, 224, 3), dtype=np.uint8)
 
         for i, (image_id, diagnosis) in enumerate(zip(data['id_code'], data['diagnosis'])):
             f_path = os.path.join(train_dir, diagnosis, image_id + ".png")
-            x_train[i, :, :, :] = preprocess_image(
-                f_path
-            )
+            x_train[i, :, :, :] = preprocess_image(f_path, grayscale=True, output_channels=3)
             print("processed {} of {}".format(i+1, N))
 
-        np.save(cache_file, x_train)
+        np.save(train_cache_file, x_train)
 
     else:
-        x_train = np.load(cache_file)
+        x_train = np.load(train_cache_file)
 
     y_train = np.zeros((N, n_classes))
     for i, diagnosis in enumerate(data["diagnosis"]):
         y_train[i,:] = get_multilabel(diagnosis, n_classes)
 
     train_data = {"x" : x_train, "y" : y_train}
-    
-    classifier = Classifier(labels=["0", "1", "2", "3", "4"])
-    classifier.build()
-    classifier.train(train_data)
 
-    # classifier = Classifier(labels=["0", "1", "2", "3", "4"])
-    # classifier.build()
-    # classifier.train(train_dir)
+    classifier = Classifier(labels=["0", "1", "2", "3", "4"])
+    classifier.build(densenet_weights=densenet_weights)
+    classifier.train(train_data, epochs=epochs)
+
+def test_model(csv_file, 
+               test_dir, 
+               n_classes=5, 
+               model="best_model.hdf5",
+               test_cache_file="x_test.npy", 
+               cached_predictions="predictions.npy", 
+               submission_file="submission.csv"):
+
+    data, N = read_csv(csv_file)
+    
+    if not os.path.exists(test_cache_file):
+
+        x_test = np.empty((N, 224, 224, 3), dtype=np.uint8)
+
+        for i, image_id in enumerate(data['id_code']):
+            f_path = os.path.join(test_dir, image_id + ".png")
+            x_test[i, :, :, :] = preprocess_image(f_path, grayscale=True, output_channels=3)
+            print("processed {} of {}".format(i+1, N))
+
+        np.save(test_cache_file, x_test)
+
+    else:
+        x_test = np.load(test_cache_file)
+    
+    if not os.path.exists(cached_predictions):
+        classifier = Classifier(labels=["0", "1", "2", "3", "4"])
+        classifier.load(model)
+        predictions = classifier.predict(x_test)
+        np.save(cached_predictions, predictions)
+    else:
+        predictions = np.load(cached_predictions)
+
+    y_test = predictions > 0.5
+    y_test = y_test.astype(int).sum(axis=1) - 1
+
+    submission_df = pd.read_csv(csv_file)
+    submission_df['diagnosis'] = y_test
+    submission_df.to_csv('submission.csv', index=False)
+
+
+if __name__ == "__main__":
+
+    kaggle_run = False
+
+    if not kaggle_run:
+        train_dir = "/media/hdd/data/train_images"
+        test_dir = "/media/hdd/data/test_images"
+        train_csv = "/media/hdd/data/train.csv"
+        test_csv = "/media/hdd/data/test.csv"
+        densenet_weights = '/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5'
+    else:
+        train_dir = "../input/aptos2019-blindness-detection/train_images"
+        train_csv = "../input/aptos2019-blindness-detection/train.csv"
+        test_dir = "../input/aptos2019-blindness-detection/test_images"
+        test_csv = "../input/aptos2019-blindness-detection/test.csv"
+        densenet_weights = '../input/densenet-keras/DenseNet-BC-121-32-no-top.h5'
+
+    train_model(train_csv, train_dir, epochs=20, densenet_weights=densenet_weights)
+    test_model(test_csv, test_dir)
