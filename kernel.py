@@ -15,8 +15,10 @@ from keras.optimizers import Adam
 from sklearn.metrics import cohen_kappa_score
 import cv2 as cv
 import pandas as pd
+import preprocessing
+from tqdm import tqdm
 
-os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/extras/CUPTI/lib64"
+os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda-10.0/lib64"
 
 def read_csv(filename, delimiter=','):
 
@@ -27,7 +29,7 @@ def read_csv(filename, delimiter=','):
 
         csv_reader = csv.reader(f, delimiter=delimiter)
 
-        for i, row in enumerate(csv_reader):
+        for i, row in tqdm(enumerate(csv_reader)):
 
             if i == 0:
                 keys = row
@@ -36,8 +38,6 @@ def read_csv(filename, delimiter=','):
             else:
                 for key, data in zip(keys, row):
                     csv_data[key].append(data)
-
-        print('Processed {} lines.'.format(i))
 
     return csv_data, i
 
@@ -52,29 +52,11 @@ def write_csv(filename, data, delimiter=',', index=True):
         if index:
             csv_writer.writerow(keys)
 
-        for i in range(rows):
+        for i in tqdm(range(rows)):
             row = []
             for key in keys:
                 row.append(data[key][i])
             csv_writer.writerow(row)
-
-        print('Processed {} lines.'.format(i))
-
-
-def preprocess_image(image_path, grayscale=False, width=224, height=224, output_channels=None):
-    img = cv.imread(image_path)
-    img = cv.resize(img, (width, height), interpolation=cv.INTER_CUBIC)
-
-    if grayscale:
-        img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-        img = cv.addWeighted(img, 4, cv.GaussianBlur(img, (0,0) , (width+height)/20), -4, 128)
-
-        if output_channels is None:
-            img = np.expand_dims(img, axis=2)
-        else:
-            img = np.stack([img] * output_channels, axis=2)
-
-    return img
 
 class CustomMetric(Callback):
 
@@ -109,44 +91,50 @@ class Classifier():
         self.label_size = len(labels)
 
     def build(self, densenet=True, verbose=True, 
-              densenet_weights='/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5'):
+              densenet_weights='/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5',
+              lr=0.00005):
 
         if not densenet:
 
             self.model = Sequential()
-            self.model.add(Conv2D(filters=16,
-                                kernel_size=(5, 5),
+            self.model.add(Conv2D(filters=64,
+                                kernel_size=(3, 3),
                                 padding="same",
                                 input_shape=self.input_dims))
             self.model.add(BatchNormalization())
             self.model.add(Activation("relu"))
             self.model.add(MaxPooling2D(pool_size=(2,2), padding="same"))
-            self.model.add(Conv2D(filters=32,
-                                kernel_size=(5, 5),
+            self.model.add(Conv2D(filters=64,
+                                kernel_size=(3, 3),
                                 padding="same"))
             self.model.add(BatchNormalization())
             self.model.add(Activation("relu"))
             self.model.add(MaxPooling2D(pool_size=(2, 2), padding="same"))
             self.model.add(Conv2D(filters=64,
-                                kernel_size=(5, 5),
+                                kernel_size=(3, 3),
                                 padding="same"))
             self.model.add(BatchNormalization())
             self.model.add(Activation("relu"))
-
+            self.model.add(MaxPooling2D(pool_size=(2, 2), padding="same"))
+            self.model.add(Conv2D(filters=64,
+                                kernel_size=(3, 3),
+                                padding="same"))
+            self.model.add(BatchNormalization())
+            self.model.add(Activation("relu"))
             self.model.add(Flatten())
             self.model.add(Dense(units=256))
             self.model.add(BatchNormalization())
             self.model.add(Activation("relu"))
-            self.model.add(Dropout(0.25))
+            self.model.add(Dropout(0.5))
             self.model.add(Dense(units= 128))
             self.model.add(BatchNormalization())
             self.model.add(Activation("relu"))
-            self.model.add(Dropout(0.25))
+            self.model.add(Dropout(0.5))
             self.model.add(Dense(units=64))
             self.model.add(BatchNormalization())
             self.model.add(Activation("relu"))
-            self.model.add(Dropout(0.25))
-            self.model.add(Dense(units=self.label_size, activation="softmax"))
+            self.model.add(Dropout(0.5))
+            self.model.add(Dense(units=self.label_size, activation="sigmoid"))
 
         else:
             densenet = DenseNet121(
@@ -165,10 +153,10 @@ class Classifier():
         if verbose:
             self.model.summary()
 
-        self._compile()
+        self._compile(lr=lr)
 
-    def _compile(self, loss='binary_crossentropy'):
-        optimizer = Adam(lr=0.00005)
+    def _compile(self, loss='binary_crossentropy', lr=0.00005):
+        optimizer = Adam(lr=lr)
         self.model.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
 
     def train(self, data, data_split=0.15, epochs=100, batch_size=8, use_callbacks=True):
@@ -298,10 +286,9 @@ def train_model(csv_file, train_dir, n_classes=5, train_cache_file="x_train.npy"
 
         x_train = np.empty((N, 224, 224, 3), dtype=np.uint8)
 
-        for i, (image_id, diagnosis) in enumerate(zip(data['id_code'], data['diagnosis'])):
+        for i, (image_id, diagnosis) in tqdm(enumerate(zip(data['id_code'], data['diagnosis'])), total=len(data['id_code'])):
             f_path = os.path.join(train_dir, diagnosis, image_id + ".png")
-            x_train[i, :, :, :] = preprocess_image(f_path, grayscale=True, output_channels=3)
-            print("processed {} of {}".format(i+1, N))
+            x_train[i, :, :, :] = preprocessing.preprocess_image(f_path, grayscale=False, output_channels=3)
 
         np.save(train_cache_file, x_train)
 
@@ -315,7 +302,8 @@ def train_model(csv_file, train_dir, n_classes=5, train_cache_file="x_train.npy"
     train_data = {"x" : x_train, "y" : y_train}
 
     classifier = Classifier(labels=["0", "1", "2", "3", "4"])
-    classifier.build(densenet_weights=densenet_weights)
+    classifier.build(lr=0.001, densenet_weights=densenet_weights)
+    # classifier.build(lr=0.001, densenet=False)
     classifier.train(train_data, epochs=epochs)
 
 def test_model(csv_file, 
@@ -332,10 +320,9 @@ def test_model(csv_file,
 
         x_test = np.empty((N, 224, 224, 3), dtype=np.uint8)
 
-        for i, image_id in enumerate(data['id_code']):
+        for i, image_id in tqdm(enumerate(data['id_code'])):
             f_path = os.path.join(test_dir, image_id + ".png")
-            x_test[i, :, :, :] = preprocess_image(f_path, grayscale=True, output_channels=3)
-            print("processed {} of {}".format(i+1, N))
+            x_test[i, :, :, :] = preprocessing.preprocess_image(f_path, grayscale=False, output_channels=3)
 
         np.save(test_cache_file, x_test)
 
