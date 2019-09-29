@@ -17,7 +17,9 @@ import cv2 as cv
 import pandas as pd
 import preprocessing
 from tqdm import tqdm
+import argparse
 
+DEFAULT_DATA_DIR = "/media/hdd/data/"
 os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda-10.0/lib64"
 
 def read_csv(filename, delimiter=','):
@@ -40,23 +42,6 @@ def read_csv(filename, delimiter=','):
                     csv_data[key].append(data)
 
     return csv_data, i
-
-def write_csv(filename, data, delimiter=',', index=True):
-
-    keys = [key for key in data]
-    rows = len(data[keys[0]])
-
-    with open(filename, mode='w') as f:
-        csv_writer = csv.writer(f, delimiter=delimiter)
-
-        if index:
-            csv_writer.writerow(keys)
-
-        for i in tqdm(range(rows)):
-            row = []
-            for key in keys:
-                row.append(data[key][i])
-            csv_writer.writerow(row)
 
 class CustomMetric(Callback):
 
@@ -90,65 +75,21 @@ class Classifier():
         self.labels = labels
         self.label_size = len(labels)
 
-    def build(self, densenet=True, verbose=True, 
+    def build(self, verbose=True, 
               densenet_weights='/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5',
               lr=0.00005):
 
-        if not densenet:
+        densenet = DenseNet121(
+            weights=densenet_weights,
+            include_top=False,
+            input_shape=self.input_dims
+        )
 
-            self.model = Sequential()
-            self.model.add(Conv2D(filters=64,
-                                kernel_size=(3, 3),
-                                padding="same",
-                                input_shape=self.input_dims))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(MaxPooling2D(pool_size=(2,2), padding="same"))
-            self.model.add(Conv2D(filters=64,
-                                kernel_size=(3, 3),
-                                padding="same"))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(MaxPooling2D(pool_size=(2, 2), padding="same"))
-            self.model.add(Conv2D(filters=64,
-                                kernel_size=(3, 3),
-                                padding="same"))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(MaxPooling2D(pool_size=(2, 2), padding="same"))
-            self.model.add(Conv2D(filters=64,
-                                kernel_size=(3, 3),
-                                padding="same"))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(Flatten())
-            self.model.add(Dense(units=256))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(Dropout(0.5))
-            self.model.add(Dense(units= 128))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(Dropout(0.5))
-            self.model.add(Dense(units=64))
-            self.model.add(BatchNormalization())
-            self.model.add(Activation("relu"))
-            self.model.add(Dropout(0.5))
-            self.model.add(Dense(units=self.label_size, activation="sigmoid"))
-
-        else:
-            densenet = DenseNet121(
-                weights=densenet_weights,
-                include_top=False,
-                input_shape=self.input_dims
-            )
-
-            self.model = Sequential()
-            self.model.add(densenet)
-            self.model.add(GlobalAveragePooling2D())
-            self.model.add(Dropout(0.5))
-            self.model.add(Dense(self.label_size, activation='sigmoid'))
-
+        self.model = Sequential()
+        self.model.add(densenet)
+        self.model.add(GlobalAveragePooling2D())
+        self.model.add(Dropout(0.5))
+        self.model.add(Dense(self.label_size, activation='sigmoid'))
 
         if verbose:
             self.model.summary()
@@ -164,15 +105,13 @@ class Classifier():
         x, y = data["x"], data["y"]
         x_train, x_val, y_train, y_val = train_test_split(x, y, test_size=data_split)
 
-        train_datagen = ImageDataGenerator(zoom_range=0.15,
+        train_datagen = ImageDataGenerator(zoom_range=0.20,
+                                           rotation_range=5,
                                            fill_mode='constant',
                                            cval=0.,
                                            horizontal_flip=True,
                                            vertical_flip=True)
         train_datagen.fit(x_train)
-
-        # val_datagen = ImageDataGenerator(rescale=1./255)
-        # val_datagen.fit(x_val)
 
         if use_callbacks:
             early_stopping = EarlyStopping(monitor='val_loss', patience=5)
@@ -196,58 +135,8 @@ class Classifier():
         self.model.fit_generator(train_datagen.flow(x_train, y_train, batch_size=batch_size),
                                  steps_per_epoch=len(x_train) / batch_size, 
                                  epochs=epochs,
-                                #  validation_data=val_datagen.flow(x_val, y_val, batch_size=batch_size),
                                  validation_data=(x_val, y_val),
                                  validation_steps=x_val.shape[0]//batch_size, 
-                                 callbacks=callbacks)
-
-    def train_flow_from_directory(self, train_data_dir, data_split=0.5, epochs=100, batch_size=4, use_callbacks=True):
-        
-        train_datagen = ImageDataGenerator(
-            rescale=1./255,
-            zoom_range=0.2,
-            validation_split=data_split) # set validation split
-
-        train_generator = train_datagen.flow_from_directory(
-            train_data_dir,
-            target_size=(self.image_height, self.image_width),
-            color_mode=self.get_colormode(),
-            batch_size=batch_size,
-            class_mode='categorical',
-            subset='training')
-
-        validation_generator = train_datagen.flow_from_directory(
-            train_data_dir,
-            target_size=(self.image_height, self.image_width),
-            color_mode=self.get_colormode(),
-            batch_size=batch_size,
-            class_mode='categorical',
-            subset='validation')
-
-        validation_steps = validation_generator.samples // batch_size
-
-        if use_callbacks:
-            early_stopping = EarlyStopping(monitor='val_loss', patience=8)
-            mcp_save = ModelCheckpoint('best_model.hdf5', 
-                                       save_best_only=True, 
-                                       monitor='val_loss')
-            reduce_lr_loss = ReduceLROnPlateau(monitor='val_loss', 
-                                               factor=0.5, 
-                                               patience=5, 
-                                               verbose=1, 
-                                               epsilon=1e-4)
-
-            qwk = CustomMetric()
-            callbacks = [early_stopping, mcp_save, reduce_lr_loss, qwk]
-        else:
-            callbacks = None
-
-        # fits the model on batches with real-time data augmentation:
-        self.model.fit_generator(train_generator,
-                                 steps_per_epoch=train_generator.samples // batch_size,
-                                 epochs=epochs,
-                                 validation_data = validation_generator, 
-                                 validation_steps = validation_steps,
                                  callbacks=callbacks)
 
     def predict(self, data):
@@ -302,8 +191,7 @@ def train_model(csv_file, train_dir, n_classes=5, train_cache_file="x_train.npy"
     train_data = {"x" : x_train, "y" : y_train}
 
     classifier = Classifier(labels=["0", "1", "2", "3", "4"])
-    classifier.build(lr=0.001, densenet_weights=densenet_weights)
-    # classifier.build(lr=0.001, densenet=False)
+    classifier.build(densenet_weights=densenet_weights)
     classifier.train(train_data, epochs=epochs)
 
 def test_model(csv_file, 
@@ -344,17 +232,26 @@ def test_model(csv_file,
     submission_df['diagnosis'] = y_test
     submission_df.to_csv('submission.csv', index=False)
 
+def _argparser():
+    parser = argparse.ArgumentParser(description='Script to train kernel for the APTOS 2019 Blindness Detection Kaggle competion')
+    parser.add_argument("-d", "--directory", default=DEFAULT_DATA_DIR, required=False, help="path to data directory")
+    parser.add_argument("-e", "--epochs", default=20, required=False, type=int, help="number of epochs")
+    parser.add_argument("--kaggle-run", dest='kaggle_run', action='store_true', help="add flag if this is a kaggle run")
 
-if __name__ == "__main__":
+    return parser
 
-    kaggle_run = False
+def main(args):
+
+    data_dir = args.directory
+    kaggle_run = args.kaggle_run
+    epochs = args.epochs
 
     if not kaggle_run:
-        train_dir = "/media/hdd/data/train_images"
-        test_dir = "/media/hdd/data/test_images"
-        train_csv = "/media/hdd/data/train.csv"
-        test_csv = "/media/hdd/data/test.csv"
-        densenet_weights = '/media/hdd/data/densenet/DenseNet-BC-121-32-no-top.h5'
+        train_dir = os.path.join(data_dir, "train_images")
+        test_dir = os.path.join(data_dir, "test_images")
+        train_csv = os.path.join(data_dir, "train.csv")
+        test_csv =  os.path.join(data_dir, "test.csv")
+        densenet_weights =  os.path.join(data_dir, "densenet", "DenseNet-BC-121-32-no-top.h5")
     else:
         train_dir = "../input/aptos2019-blindness-detection/train_images"
         train_csv = "../input/aptos2019-blindness-detection/train.csv"
@@ -362,5 +259,9 @@ if __name__ == "__main__":
         test_csv = "../input/aptos2019-blindness-detection/test.csv"
         densenet_weights = '../input/densenet-keras/DenseNet-BC-121-32-no-top.h5'
 
-    train_model(train_csv, train_dir, epochs=20, densenet_weights=densenet_weights)
+    train_model(train_csv, train_dir, epochs=epochs, densenet_weights=densenet_weights)
     test_model(test_csv, test_dir)
+
+if __name__ == "__main__":
+    args = _argparser().parse_args()
+    main(args)
